@@ -18,11 +18,60 @@ const AIM_DECAY_WEIGHT: f64 = 0.9;
 const AIM_DIFFICULTY_MULTIPLIER: f64 = 1.06;
 const AIM_REDUCED_SECTION_COUNT: usize = 10;
 
-const AIM_HISTORY_LENGTH: usize = 2;
+const AIM_HISTORY_LENGTH: usize = 8;
 const AIM_WIDE_ANGLE_MULTIPLIER: f64 = 1.5;
 const AIM_ACUTE_ANGLE_MULTIPLIER: f64 = 2.0;
 const AIM_SLIDER_MULTIPLIER: f64 = 1.5;
 const AIM_VELOCITY_CHANGE_MULTIPLIER: f64 = 0.75;
+
+// The core aim calculation only uses the two most recent objects. The history
+// is kept longer than that so the relax aim evaluator (and the hybrid
+// detection it shares with vanilla) can measure how much the recent pattern
+// varies over a window. The extra entries are ignored by the core aim math, so
+// vanilla aim difficulty is unchanged by the larger window (the only vanilla
+// change is the slight hybrid buff below).
+
+// ---- Windowed pattern-variance detection (relax aim + hybrid buff) ----
+// Minimum samples (current object + recent history) before any variance-based
+// adjustment is applied, and minimum valid angle samples to trust angle spread.
+const AIM_WINDOW_MIN_SAMPLES: usize = 4;
+const AIM_WINDOW_MIN_ANGLES: usize = 3;
+
+// Reference spreads. A metric at/above its reference counts as "fully varied"
+// (sameness 0); near zero it is "identical" (sameness 1). `*_CV_REF` are
+// coefficients of variation (stddev / mean); ANGLE_STD_REF is in radians.
+const AIM_DIST_CV_REF: f64 = 0.35;
+const AIM_VEL_CV_REF: f64 = 0.35;
+const AIM_RHYTHM_CV_REF: f64 = 0.20;
+const AIM_ANGLE_STD_REF: f64 = 0.55;
+
+// Relax repeated-pattern nerf (consistent velocity / distance / angle / rhythm).
+// Strength fades out as the jump BPM climbs: full below MIN, gone above MAX.
+// BPM here assumes 1/2-beat ("jump") spacing: bpm = 30000 / strain_time, so a
+// 1/4 stream at song-BPM B reads as 2*B here. Tune to taste.
+const RELAX_CONSISTENCY_BPM_MIN: f64 = 310.0;
+const RELAX_CONSISTENCY_BPM_MAX: f64 = 410.0;
+const RELAX_MAX_CONSISTENCY_NERF: f64 = 0.35;
+
+// Relax speed-slop flow nerf: tightly spaced ("close together") flow aim is
+// trivial under relax. FLOW_DIST_* are normalized spacings (diameter = 100);
+// the nerf ramps in as the windowed mean spacing drops from REF toward TIGHT.
+// FLOW_BASE is the share of the nerf applied to tight flow even when the
+// pattern is not perfectly repetitive.
+const RELAX_FLOW_DIST_REF: f64 = 110.0;
+const RELAX_FLOW_DIST_TIGHT: f64 = 20.0;
+const RELAX_FLOW_BASE: f64 = 0.5;
+const RELAX_MAX_FLOW_NERF: f64 = 0.45;
+
+// Hybrid (flow + jumps) buff. Triggered by high spacing/velocity variation in a
+// window that also contains a genuine jump. Applied on relax (larger) and
+// vanilla (slight, since speed still contributes to vanilla pp).
+const AIM_HYBRID_VAR_LO: f64 = 0.35;
+const AIM_HYBRID_VAR_HI: f64 = 0.65;
+const AIM_HYBRID_JUMP_LO: f64 = 160.0;
+const AIM_HYBRID_JUMP_HI: f64 = 360.0;
+const RELAX_HYBRID_BUFF: f64 = 0.25;
+const VANILLA_HYBRID_BUFF: f64 = 0.07;
 
 const SPEED_SKILL_MULTIPLIER: f64 = 1375.0;
 const SPEED_STRAIN_DECAY_BASE: f64 = 0.3;
@@ -42,15 +91,6 @@ const FLASHLIGHT_DIFFICULTY_MULTIPLIER: f64 = 1.06;
 const FLASHLIGHT_REDUCED_SECTION_COUNT: usize = 10;
 
 const FLASHLIGHT_HISTORY_LENGTH: usize = 10;
-
-const ANGLE_WINDOW: usize = 8;
-
-const RELAX_MIN_NERF: f64 = 0.05;
-const RELAX_MAX_NERF: f64 = 0.20;
-const RELAX_BPM_START: f64 = 340.0;
-const RELAX_BPM_END: f64 = 400.0;
-
-const GUARANTEED_AIM_REDUCTION: f64 = 0.20;
 
 #[derive(Clone)]
 pub(crate) struct AimHistoryEntry {
@@ -117,6 +157,24 @@ impl From<&DifficultyObject<'_>> for SpeedHistoryEntry {
     }
 }
 
+// Summary statistics of how much the recent aim pattern varies. Computed over
+// the current object plus the most recent `AIM_HISTORY_LENGTH` objects and used
+// to drive the relax aim nerfs and the (relax + vanilla) hybrid buff.
+struct AimWindowStats {
+    /// Coefficient of variation of jump distances.
+    dist_cv: f64,
+    /// Coefficient of variation of jump velocities (distance / strain_time).
+    vel_cv: f64,
+    /// Coefficient of variation of strain times (rhythm regularity).
+    rhythm_cv: f64,
+    /// Standard deviation of angles, in radians.
+    angle_std: f64,
+    /// Mean jump distance over the window (normalized units, diameter = 100).
+    mean_dist: f64,
+    /// Largest jump distance in the window (normalized units).
+    max_dist: f64,
+}
+
 #[derive(Clone)]
 pub(crate) enum SkillKind {
     Aim {
@@ -173,6 +231,59 @@ impl SkillKind {
             Self::Flashlight { history, .. } => history.push_front(current.into()),
             Self::Speed { history, .. } => history.push_front(current.into()),
         }
+    }
+
+    // Summary statistics describing how much the recent aim pattern varies,
+    // over the current object plus the most recent history (up to
+    // `AIM_HISTORY_LENGTH` objects). Returns `None` when there aren't enough
+    // samples (or angle samples) to judge. Shared by the vanilla and relax aim
+    // evaluators; only the relax evaluator acts on the nerf-related fields.
+    fn aim_window_stats(
+        curr: &DifficultyObject<'_>,
+        history: &VecDeque<AimHistoryEntry>,
+    ) -> Option<AimWindowStats> {
+        let mut dists = Vec::with_capacity(history.len() + 1);
+        let mut vels = Vec::with_capacity(history.len() + 1);
+        let mut times = Vec::with_capacity(history.len() + 1);
+        let mut angles = Vec::with_capacity(history.len() + 1);
+
+        // Current object first.
+        dists.push(curr.jump_dist);
+        vels.push(curr.jump_dist / curr.strain_time.max(1.0));
+        times.push(curr.strain_time);
+        if let Some(a) = curr.angle {
+            angles.push(a);
+        }
+
+        // Then the recent non-spinner history.
+        for h in history.iter() {
+            if h.is_spinner {
+                continue;
+            }
+
+            dists.push(h.jump_dist);
+            vels.push(h.jump_dist / h.strain_time.max(1.0));
+            times.push(h.strain_time);
+            if let Some(a) = h.angle {
+                angles.push(a);
+            }
+        }
+
+        if dists.len() < AIM_WINDOW_MIN_SAMPLES || angles.len() < AIM_WINDOW_MIN_ANGLES {
+            return None;
+        }
+
+        let mean_dist = dists.iter().sum::<f64>() / dists.len() as f64;
+        let max_dist = dists.iter().copied().fold(0.0_f64, f64::max);
+
+        Some(AimWindowStats {
+            dist_cv: coeff_of_variation(&dists),
+            vel_cv: coeff_of_variation(&vels),
+            rhythm_cv: coeff_of_variation(&times),
+            angle_std: std_dev(&angles),
+            mean_dist,
+            max_dist,
+        })
     }
 
     fn aim_strain_vanilla(
@@ -325,12 +436,27 @@ impl SkillKind {
             aim_strain += slider_bonus * AIM_SLIDER_MULTIPLIER;
         }
 
-        aim_strain *= 1.0 - GUARANTEED_AIM_REDUCTION; // ensure there's always a minimum nerf to vanilla aim.
-        aim_strain
+        // Hybrid (flow + jumps) buff. Vanilla only gets a slight buff because
+        // speed still contributes to vanilla pp. See `aim_window_stats`.
+        if let Some(w) = Self::aim_window_stats(curr, history) {
+            let var = ((w.dist_cv.max(w.vel_cv) - AIM_HYBRID_VAR_LO)
+                / (AIM_HYBRID_VAR_HI - AIM_HYBRID_VAR_LO))
+                .clamp(0.0, 1.0);
+            let jump_presence = ((w.max_dist - AIM_HYBRID_JUMP_LO)
+                / (AIM_HYBRID_JUMP_HI - AIM_HYBRID_JUMP_LO))
+                .clamp(0.0, 1.0);
+            let hybridness = var * jump_presence;
 
-    // Relax aim evaluation. Currently an exact copy of `aim_strain_vanilla`
-    // above; kept as a separate code path so relax-specific aim tuning can
-    // be applied here later without touching the vanilla aim evaluation.
+            aim_strain *= 1.0 + VANILLA_HYBRID_BUFF * hybridness;
+        }
+
+        aim_strain
+    }
+
+    // Relax aim evaluation. Starts from the same per-object aim strain as
+    // `aim_strain_vanilla`, then applies relax-specific windowed-variance
+    // adjustments: a repeated-pattern nerf, a tight-spacing "speed-slop" flow
+    // nerf, and a flow+jump hybrid buff. See the RELAX_* / AIM_* constants.
     fn aim_strain_relax(
         curr: &DifficultyObject<'_>,
         history: &VecDeque<AimHistoryEntry>,
@@ -339,86 +465,6 @@ impl SkillKind {
         if curr.base.is_spinner() || history.len() < 2 || history[0].is_spinner {
             return 0.0;
         }
-
-    // Computes mean and standard deviation of angles in the window, as well as the count of valid angles considered (including current object). Used for relax nerf calculation.
-    // NOTE: this system is temporary and ported from ccv3 to provide a quick solution for relax nerfs, and will be replaced with a separate implementation.
-    // NOTE 2: I honestly don't know if the ccv3 windowed variance system will work as intended in this repo due to differences in evaluators and how aim strain is calculated,
-    // due to the stark difference in code structure between this repo and ccv3, so this is something that will require testing and tweaking to make sure it works as intended.
-    // NOTE 3: again this system is temporary so if it doesn't work perfectly that's not a huge issue, as long as it provides a reasonable nerf for now until i can implement a new solution.
-    fn windowed_angle_stats(
-        curr: &DifficultyObject<'_>,
-        history: &VecDeque<AimHistoryEntry>,
-        window: usize,
-    ) -> (f64, f64, usize) {
-        let mut angles: Vec<f64> = Vec::with_capacity(window + 1);
-
-        if let Some(a) = curr.angle {
-            angles.push(a);
-        }
-
-        for (i, prev) in history.iter().take(window).enumerate() {
-            if let Some(a) = prev.angle {
-                angles.push(a);
-            } else {
-                break;
-            }
-        }
-
-        let n = angles.len();
-        if n < 3 {
-            return (0.0, 0.0, n);
-        }
-
-        let mean: f64 = angles.iter().sum::<f64>() / n as f64;
-        let variance: f64 = angles.iter().map(|a| (a - mean).powi(2)).sum::<f64>() / n as f64;
-        (mean, variance.sqrt(), n)
-    }
-
-    fn windowed_dist_stats(
-        curr: &DifficultyObject<'_>,
-        history: &VecDeque<AimHistoryEntry>,
-        window: usize,
-    ) -> (f64, f64, usize) {
-        let mut dists: Vec<f64> = Vec::with_capacity(window + 1);
-        dists.push(curr.jump_dist);
-
-        for prev in history.iter().take(window) {
-            dists.push(prev.jump_dist);
-        }
-
-        let n = dists.len();
-        if n < 2 {
-            return (0.0, 0.0, n);
-        }
-        let mean = dists.iter().sum::<f64>() / n as f64;
-        let var = dists.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / n as f64;
-        (mean, var.sqrt(), n)
-    }
-
-    fn windowed_vel_stats(
-        curr: &DifficultyObject<'_>,
-        history: &VecDeque<AimHistoryEntry>,
-        window: usize,
-    ) -> (f64, f64, usize) {
-        let mut vels: Vec<f64> = Vec::with_capacity(window + 1);
-        if curr.strain_time > 0.0 {
-            vels.push(curr.jump_dist / curr.strain_time);
-        }
-
-        for prev in history.iter().take(window) {
-            if prev.strain_time > 0.0 {
-                vels.push(prev.jump_dist / prev.strain_time);
-            }
-        }
-
-        let n = vels.len();
-        if n < 2 {
-            return (0.0, 0.0, n);
-        }
-        let mean = vels.iter().sum::<f64>() / n as f64;
-        let var = vels.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
-        (mean, var.sqrt(), n)
-    }
 
         let prev = &history[0];
         let prev_prev = &history[1];
@@ -469,7 +515,7 @@ impl SkillKind {
 
                 wide_angle_bonus = calculate_wide_angle_bonus(curr_angle);
 
-                // * Only bufff delta_time exceeding 300 bpm 1/2.
+                // * Only buff delta_time exceeding 300 bpm 1/2.
                 if curr.strain_time <= 100.0 {
                     let curr_bonus = calculate_acute_angle_bonus(curr_angle);
 
@@ -561,88 +607,48 @@ impl SkillKind {
             aim_strain += slider_bonus * AIM_SLIDER_MULTIPLIER;
         }
 
-        aim_strain
-    }
+        // Measure the recent window and (1) nerf
+        // consistent/repeated patterns, (2) heavily nerf tightly spaced
+        // "speed-slop" flow, and (3) buff genuine flow+jump hybrids.
+        if let Some(w) = Self::aim_window_stats(curr, history) {
+            // Per-metric sameness in [0, 1] (1 == unchanging across the window).
+            let dist_same = 1.0 - (w.dist_cv / AIM_DIST_CV_REF).clamp(0.0, 1.0);
+            let vel_same = 1.0 - (w.vel_cv / AIM_VEL_CV_REF).clamp(0.0, 1.0);
+            let rhythm_same = 1.0 - (w.rhythm_cv / AIM_RHYTHM_CV_REF).clamp(0.0, 1.0);
+            let angle_same = 1.0 - (w.angle_std / AIM_ANGLE_STD_REF).clamp(0.0, 1.0);
 
-        // * Apply sloppiness-based nerf if pattern is repetitive
-        // We consider a window of previous objects and check angle, distance and
-        // velocity stability. If at least two of these stay roughly constant we
-        // apply a nerf between `RELAX_MIN_NERF` and `RELAX_MAX_NERF`, scaled
-        // down linearly from `RELAX_BPM_START` to `RELAX_BPM_END`.
-        // NOTE: this system is temporary and will be replaced with a similar system.
-        // NOTE 2: same concern as `windowed_angle_stats` about whether this will work as intended in this repo due to differences in code structure and how aim strain is calculated (relies on ccv3 varience).          
-        if with_sliders || true {
-            let (angle_mean, angle_std, angle_n) =
-                windowed_angle_stats(curr, history, ANGLE_WINDOW);
-            let (dist_mean, dist_std, dist_n) =
-                windowed_dist_stats(curr, history, ANGLE_WINDOW);
-            let (vel_mean, vel_std, vel_n) = windowed_vel_stats(curr, history, ANGLE_WINDOW);
+            // High only when distance, velocity, angle and rhythm are all flat.
+            let consistency = dist_same * vel_same * rhythm_same * angle_same;
 
-            let mut low_count = 0usize;
-            if angle_n >= 3 && angle_std < 0.3 {
-                low_count += 1;
-            }
-            if dist_n >= 2 && dist_mean > 0.0 && (dist_std / dist_mean) < 0.25 {
-                low_count += 1;
-            }
-            if vel_n >= 2 && vel_mean > 0.0 && (vel_std / vel_mean) < 0.25 {
-                low_count += 1;
-            }
+            // (1) Repeated-pattern nerf, faded out as the jump BPM climbs.
+            let jump_bpm = 30000.0 / curr.strain_time.max(1.0);
+            let bpm_factor = ((RELAX_CONSISTENCY_BPM_MAX - jump_bpm)
+                / (RELAX_CONSISTENCY_BPM_MAX - RELAX_CONSISTENCY_BPM_MIN))
+                .clamp(0.0, 1.0);
+            let consistency_nerf =
+                1.0 - RELAX_MAX_CONSISTENCY_NERF * consistency * bpm_factor;
 
-            if low_count >= 2 {
-                // compute constancy measures in [0,1]
-                let mut sum_const = 0.0;
-                let mut cnt = 0.0;
+            // (2) Speed-slop flow nerf: tight spacing, worse when repetitive.
+            let flow_smallness = ((RELAX_FLOW_DIST_REF - w.mean_dist)
+                / (RELAX_FLOW_DIST_REF - RELAX_FLOW_DIST_TIGHT))
+                .clamp(0.0, 1.0);
+            let flow_slop = flow_smallness
+                * (RELAX_FLOW_BASE + (1.0 - RELAX_FLOW_BASE) * consistency);
+            let flow_nerf = 1.0 - RELAX_MAX_FLOW_NERF * flow_slop;
 
-                if angle_n >= 3 {
-                    let angle_const = (1.0 - (angle_std / (FRAC_PI_2))).clamp(0.0, 1.0);
-                    sum_const += angle_const;
-                    cnt += 1.0;
-                }
+            // (3) Hybrid (flow + jumps) buff.
+            let var = ((w.dist_cv.max(w.vel_cv) - AIM_HYBRID_VAR_LO)
+                / (AIM_HYBRID_VAR_HI - AIM_HYBRID_VAR_LO))
+                .clamp(0.0, 1.0);
+            let jump_presence = ((w.max_dist - AIM_HYBRID_JUMP_LO)
+                / (AIM_HYBRID_JUMP_HI - AIM_HYBRID_JUMP_LO))
+                .clamp(0.0, 1.0);
+            let hybridness = var * jump_presence;
+            let hybrid_buff = 1.0 + RELAX_HYBRID_BUFF * hybridness;
 
-                if dist_n >= 2 && dist_mean > 0.0 {
-                    let dist_const = (1.0 - (dist_std / dist_mean)).clamp(0.0, 1.0);
-                    sum_const += dist_const;
-                    cnt += 1.0;
-                }
-
-                if vel_n >= 2 && vel_mean > 0.0 {
-                    let vel_const = (1.0 - (vel_std / vel_mean)).clamp(0.0, 1.0);
-                    sum_const += vel_const;
-                    cnt += 1.0;
-                }
-
-                if cnt > 0.0 {
-                    let avg_const = sum_const / cnt;
-
-                    // bpm derived from strain_time (ms between objects)
-                    let bpm = if curr.strain_time > 0.0 {
-                        60_000.0 / curr.strain_time
-                    } else {
-                        RELAX_BPM_END
-                    };
-
-                    let bpm_scale = if bpm <= RELAX_BPM_START {
-                        1.0
-                    } else if bpm >= RELAX_BPM_END {
-                        0.0
-                    } else {
-                        (RELAX_BPM_END - bpm) / (RELAX_BPM_END - RELAX_BPM_START)
-                    };
-
-                    let nerf = RELAX_MIN_NERF + avg_const * (RELAX_MAX_NERF - RELAX_MIN_NERF);
-                    let nerf = nerf * bpm_scale; // reduce nerf at very high bpm
-
-                    // ensure minimum nerf for detected sloppy parts
-                    let final_nerf = nerf.max(RELAX_MIN_NERF);
-                    let final_nerf = final_nerf.min(RELAX_MAX_NERF);
-
-                    aim_strain *= 1.0 - final_nerf;
-                }
-            }
+            aim_strain *= consistency_nerf * flow_nerf * hybrid_buff;
         }
 
-        aim_strain *= 1.0 - GUARANTEED_AIM_REDUCTION; // ensure there's always a minimum nerf to relax aim, even on patterns that aren't easily detected by the above system (e.g. single jumps repeated many times)
         aim_strain
     }
 
@@ -899,6 +905,30 @@ pub(crate) fn calculate_speed_rhythm_bonus(
 
     // * produces multiplier that can be applied to strain. range [1, infinity) (not really though)
     (4.0 + rhythm_complexity_sum * SPEED_RHYTHM_MULTIPLIER).sqrt() / 2.0
+}
+
+// Population coefficient of variation (stddev / mean). Returns 0 when the mean
+// is ~0 so that fully-stacked (zero-distance) windows read as "no variation".
+fn coeff_of_variation(xs: &[f64]) -> f64 {
+    let n = xs.len() as f64;
+    let mean = xs.iter().sum::<f64>() / n;
+
+    if mean.abs() < 1e-9 {
+        return 0.0;
+    }
+
+    let var = xs.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n;
+
+    var.sqrt() / mean
+}
+
+// Population standard deviation.
+fn std_dev(xs: &[f64]) -> f64 {
+    let n = xs.len() as f64;
+    let mean = xs.iter().sum::<f64>() / n;
+    let var = xs.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n;
+
+    var.sqrt()
 }
 
 fn calculate_wide_angle_bonus(angle: f64) -> f64 {

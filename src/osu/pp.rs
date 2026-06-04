@@ -384,11 +384,17 @@ impl OsuPPInner {
 
                 // Relax penalty
                 if self.mods.rx() {
-                    // * As we're adding 100s and 50s to an approximated number of combo breaks\
-                    // * the result can be higher than total hits in specific scenarios
-                    // * (which breaks some calculations) so we need to clamp it.
-                    self.effective_misses = (self.effective_misses + self.n100 + self.n50)
-                        .min(self.total_hits as usize);
+                    // * On relax, 100s and 50s aren't real combo breaks, but they do
+                    // * reflect sloppy aim, so they inflate the effective miss count by
+                    // * a fraction of a real miss. The inflation shrinks on longer maps,
+                    // * softens as the 100/50 counts grow, and stops once those counts
+                    // * reach the caps in `relax_miss_inflation`. We still clamp the
+                    // * total since effective misses must not exceed total hits.
+                    let inflation = relax_miss_inflation(self.n100, self.n50, self.total_hits);
+
+                    self.effective_misses = (self.effective_misses as f64 + inflation)
+                        .min(self.total_hits)
+                        .floor() as usize;
 
                     multiplier *= 0.6;
                 }
@@ -442,11 +448,6 @@ impl OsuPPInner {
         if effective_misses > 0 {
             aim_value *= 0.97
                 * (1.0 - (effective_misses as f64 / total_hits).powf(0.775)).powi(effective_misses);
-        }
-
-        // Combo scaling
-        if let Some(combo) = self.combo.filter(|_| attributes.max_combo > 0) {
-            aim_value *= ((combo as f64 / attributes.max_combo as f64).powf(0.8)).min(1.0);
         }
 
         // AR bonus
@@ -509,11 +510,6 @@ impl OsuPPInner {
             speed_value *= 0.97
                 * (1.0 - (effective_misses / total_hits).powf(0.775))
                     .powf(effective_misses.powf(0.875));
-        }
-
-        // Combo scaling
-        if let Some(combo) = self.combo.filter(|_| attributes.max_combo > 0) {
-            speed_value *= ((combo as f64 / attributes.max_combo as f64).powf(0.8)).min(1.0);
         }
 
         // AR bonus
@@ -663,6 +659,57 @@ fn calculate_effective_misses(
     combo_based_misses = combo_based_misses.min(total_hits);
 
     n_misses.max(combo_based_misses.floor() as usize)
+}
+
+// On relax, clicks are automatic, so 100s/50s come from loose aim rather than
+// mistiming. They count toward effective misses, but each is worth less than a
+// real miss, the effect decreases on longer maps, it softens as the counts grow
+// (diminishing returns), and it stops once the counts reach the caps below.
+
+// Cap on the effective misses that 100s/50s can add (before the length factor).
+const RELAX_MISS_MAX_INFLATION: f64 = 4.0;
+// Length factor: object count where the raw factor is ~0.5, then clamped to
+// [MIN, MAX]. Shorter maps are penalized more, longer maps less, but never the
+// full amount and never nothing.
+const RELAX_MISS_LENGTH_REF: f64 = 500.0;
+const RELAX_MISS_LENGTH_MIN: f64 = 0.25;
+const RELAX_MISS_LENGTH_MAX: f64 = 0.75;
+// Counts at which the inflation stops growing. Reaching any one caps it:
+// ~10 hundreds, ~7 fifties, or this many combined.
+const RELAX_MISS_N100_CAP: f64 = 10.0;
+const RELAX_MISS_N50_CAP: f64 = 7.0;
+const RELAX_MISS_COMBINED_CAP: f64 = 12.0;
+// Shape of the diminishing-returns curve (> 1 => softens as the counts grow).
+const RELAX_MISS_SOFTEN_POW: f64 = 1.6;
+
+fn relax_miss_inflation(n100: usize, n50: usize, total_hits: f64) -> f64 {
+    if n100 == 0 && n50 == 0 {
+        return 0.0;
+    }
+
+    let n100 = n100 as f64;
+    let n50 = n50 as f64;
+
+    // * Length factor: the penalty decreases as the map gets longer, clamped so
+    // * short maps don't get the full amount and long maps still get something.
+    let length_factor = (RELAX_MISS_LENGTH_REF / (total_hits + RELAX_MISS_LENGTH_REF))
+        .clamp(RELAX_MISS_LENGTH_MIN, RELAX_MISS_LENGTH_MAX);
+
+    // * Progress toward the point where 100s/50s stop adding to the miss count.
+    // * Whichever cap is hit first (too many 100s, too many 50s, or too many
+    // * combined) caps the inflation. 50s advance this faster than 100s, so a
+    // * 50 weighs more than a 100.
+    let progress = (n100 / RELAX_MISS_N100_CAP)
+        .max(n50 / RELAX_MISS_N50_CAP)
+        .max((n100 + n50) / RELAX_MISS_COMBINED_CAP)
+        .min(1.0);
+
+    // * Diminishing-returns fill: grows fastest for the first few 100s/50s, then
+    // * softens and levels off at the cap, so additional mistakes never reduce
+    // * the inflation.
+    let fill = 1.0 - (1.0 - progress).powf(RELAX_MISS_SOFTEN_POW);
+
+    RELAX_MISS_MAX_INFLATION * length_factor * fill
 }
 
 /// Abstract type to provide flexibility when passing difficulty attributes to a performance calculation.
